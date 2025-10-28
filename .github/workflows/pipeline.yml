@@ -1,0 +1,39 @@
+name: substack-to-notebooklm-to-youtube
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Run
+        env:
+          SUBSTACK_FEED_URL: ${{ secrets.SUBSTACK_FEED_URL }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          # Optional NotebookLM
+          GCP_SA_KEY_JSON: ${{ secrets.GCP_SA_KEY_JSON }}
+          GOOGLE_PROJECT_ID: ${{ secrets.GOOGLE_PROJECT_ID }}
+          NOTEBOOK_ID: ${{ secrets.NOTEBOOK_ID }}
+          # Optional behavior
+          UPLOAD_SRT: "false"
+        run: python main.py
+      - name: Commit updated state
+        run: |
+          git config user.name "automation-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add state/last_item_id.json || true
+          git commit -m "update state" || echo "no changes"
+          git push || true
