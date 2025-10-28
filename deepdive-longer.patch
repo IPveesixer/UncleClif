@@ -1,0 +1,175 @@
+diff --git a/utils/notebooklm.py b/utils/notebooklm.py
+index 1b8c0b1..a3c9d77 100644
+--- a/utils/notebooklm.py
++++ b/utils/notebooklm.py
+@@ -1,26 +1,83 @@
+-import os, json
+-
+-# Placeholder thin wrapper to avoid hard-failing if you don't have access.
+-# If you do have NotebookLM Enterprise API access, implement the calls here.
+-
+-def is_enabled():
+-    return bool(os.getenv("GCP_SA_KEY_JSON") and os.getenv("GOOGLE_PROJECT_ID"))
+-
+-def ensure_notebook():
+-    # TODO: implement call to create or fetch notebook; return notebook id
+-    # For now, read NOTEBOOK_ID if present; else raise
+-    nb = os.getenv("NOTEBOOK_ID")
+-    if not nb:
+-        raise RuntimeError("NotebookLM not configured. Set NOTEBOOK_ID or implement creation.")
+-    return nb
+-
+-def add_source(notebook_id: str, url: str, source_name: str):
+-    # TODO: call notebooks.sources.batchCreate with webContent
+-    print(f"[NotebookLM MOCK] add_source({notebook_id}, {url}, {source_name})")
+-
+-def create_audio_overview(notebook_id: str, focus="Extended overview", language_code="en"):
+-    # TODO: call notebooks.audioOverviews.create
+-    print(f"[NotebookLM MOCK] create_audio_overview({notebook_id}, focus={focus})")
++import os, json, requests
++from google.oauth2 import service_account
++from google.auth.transport.requests import AuthorizedSession
++
++# Minimal wrapper that works in two modes:
++#  - If env creds are present, call the NotebookLM Enterprise API
++#  - Otherwise, print a no-op so the pipeline keeps running
++
++def is_enabled():
++    return bool(os.getenv("GCP_SA_KEY_JSON") and os.getenv("GOOGLE_PROJECT_ID") and os.getenv("NOTEBOOK_ID"))
++
++def ensure_notebook():
++    nb = os.getenv("NOTEBOOK_ID")
++    if not nb:
++        raise RuntimeError("NotebookLM not configured. Set NOTEBOOK_ID or implement creation.")
++    return nb
++
++def _host():
++    # Allow override just in case your project uses a different hostname
++    return os.getenv("NOTEBOOKLM_HOST", "https://global-discoveryengine.googleapis.com")
++
++def _nb_base(project_id: str, notebook_id: str) -> str:
++    # v1alpha path; adjust if your deployment differs
++    return f"{_host()}/v1alpha/projects/{project_id}/locations/global/notebooks/{notebook_id}"
++
++def _session():
++    creds_info = json.loads(os.environ["GCP_SA_KEY_JSON"])
++    scopes = ["https://www.googleapis.com/auth/cloud-platform"]
++    creds = service_account.Credentials.from_service_account_info(creds_info, scopes=scopes)
++    return AuthorizedSession(creds)
++
++def add_source(notebook_id: str, url: str, source_name: str):
++    # Safe no-op (kept optional). Implement real batchCreate here if desired.
++    print(f"[NotebookLM] add_source (stub): {url} - {source_name}")
++
++def create_audio_overview(
++    notebook_id: str,
++    focus="Extended overview",
++    language_code="en",
++    format_mode="DEEP_DIVE",   # BRIEF | CRITIQUE | DEBATE
++    length_mode="LONGER"       # SHORTER | DEFAULT | LONGER
++):
++    body = {
++        "episodeFocus": focus,
++        "languageCode": language_code,
++        "format": format_mode,
++        "length": length_mode
++    }
++    if not is_enabled():
++        print(f"[NotebookLM] Skipped (not configured). Would request: {body}")
++        return
++    project_id = os.environ["GOOGLE_PROJECT_ID"]
++    url = f"{_nb_base(project_id, notebook_id)}/audioOverviews"
++    try:
++        sess = _session()
++        resp = sess.post(url, json=body, timeout=120)
++        if resp.status_code >= 300:
++            raise RuntimeError(f"{resp.status_code} {resp.text}")
++        print("[NotebookLM] Audio Overview requested with", body)
++    except Exception as e:
++        # Non-fatal; continue pipeline with local TTS fallback
++        print(f"[NotebookLM] Non-fatal error while creating Audio Overview: {e}")
+diff --git a/main.py b/main.py
+index 7c6b3aa..d6f1d0c 100644
+--- a/main.py
++++ b/main.py
+@@ -22,7 +22,14 @@ def ensure_notebooklm(post_url, post_title):
+         if not nb_id:
+             nb_id = notebooklm.ensure_notebook()
+             print(f"[NotebookLM] Using notebook id: {nb_id}")
+-        notebooklm.add_source(nb_id, post_url, post_title)
+-        notebooklm.create_audio_overview(nb_id, focus="Extended deep dive and key insights for a general audience", language_code="en")
++        notebooklm.add_source(nb_id, post_url, post_title)
++        # Allow overrides via env (repo secrets in Actions):
++        fmt = os.getenv("AUDIO_FORMAT", "DEEP_DIVE")   # BRIEF | CRITIQUE | DEBATE
++        lng = os.getenv("AUDIO_LENGTH", "LONGER")      # SHORTER | DEFAULT | LONGER
++        notebooklm.create_audio_overview(
++            nb_id,
++            focus="Extended deep dive and key insights for a general audience",
++            language_code="en",
++            format_mode=fmt,
++            length_mode=lng,
++        )
+         print("[NotebookLM] Audio Overview requested.")
+     except Exception as e:
+         print(f"[NotebookLM] Non-fatal error: {e}")
+diff --git a/utils/summarize.py b/utils/summarize.py
+index 1a2b4f7..9d8b4a3 100644
+--- a/utils/summarize.py
++++ b/utils/summarize.py
+@@ -1,17 +1,18 @@
+-def long_form_overview(text: str, title: str, published: str = "") -> str:
+-    """
+-    Heuristic summary for an "extended overview":
+-    - brief intro with title/date
+-    - key ideas (topical sentences)
+-    - implications / takeaways
+-    - closing CTA to read the full post
+-    """
+-    # Very simple heuristic "chunk and keep" approach to avoid heavy dependencies.
+-    # You can swap this for an LLM call (Gemini, etc.) if desired.
+-    words = text.split()
+-    if len(words) < 1200:
+-        body = text
+-    else:
+-        body = " ".join(words[:1200])  # cap around ~10 minutes of TTS
+-
+-    intro = f"Extended overview of '{title}'. Published: {published or 'recently.'} "
+-    outro = f"\n\nFor the full context and all details, visit the original post."
+-    return intro + body + outro
++import os
++
++def long_form_overview(text: str, title: str, published: str = "") -> str:
++    """
++    Heuristic summary for an "extended overview":
++    - brief intro with title/date
++    - body capped to a target word count (configurable)
++    - closing CTA
++    """
++    words = text.split()
++    # Aim for ~15–20 minutes at ~150 wpm ? ~2250–3000 words.
++    cap = int(os.getenv("LONG_OVERVIEW_WORDS", "2600"))
++    body = text if len(words) <= cap else " ".join(words[:cap])
++
++    intro = f"Extended overview of '{title}'. Published: {published or 'recently.'} "
++    outro = "\n\nFor the full context and all details, visit the original post."
++    return intro + body + outro
+diff --git a/README.md b/README.md
+index 6f1f55a..d1f2e9d 100644
+--- a/README.md
++++ b/README.md
+@@ -72,6 +72,16 @@ Optional (NotebookLM):
+ - `NOTEBOOK_ID`
+ 
+ Optional (behavior):
+ - `UPLOAD_SRT` ? `true`/`false` (default false)
++- `AUDIO_FORMAT` ? defaults to `DEEP_DIVE` (other: `BRIEF`, `CRITIQUE`, `DEBATE`)
++- `AUDIO_LENGTH` ? defaults to `LONGER` (other: `DEFAULT`, `SHORTER`)
++- `LONG_OVERVIEW_WORDS` ? defaults to `2600` (controls local TTS fallback length)
++
++### Forcing "Deep Dive" + "Longer"
++If you have NotebookLM Enterprise access, the workflow will request Audio Overviews with:
++```
++format = DEEP_DIVE
++length = LONGER
++```
++You can override via repo/environment secrets listed above.
